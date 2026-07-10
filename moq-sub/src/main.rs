@@ -17,6 +17,9 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing with env filter (respects RUST_LOG environment variable)
     // Default to info level, but suppress quinn's verbose output
     tracing_subscriber::fmt()
+        // Media is written to stdout, so logs MUST go to stderr to avoid
+        // corrupting the fMP4 byte stream (e.g. when piped to `ffplay -`).
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,quinn=warn")),
