@@ -54,121 +54,72 @@ The SRT stream must contain codecs `moq-pub` and the browser can handle
 what browsers decode:
 
 | Constraint     | Value                              | Why                                                                 |
-|----------------|------------------------------------|---------------------------------------------------------------------|
+|----------------|-------------------------------------|-----------------------------------------------------------------------|
 | Video codec    | **H.264 / AVC** (`avc1`)           | `moq-pub` rejects HEVC (`"HEVC not yet supported"`); no AV1/VP9 path |
 | Pixel format   | `yuv420p` (8-bit 4:2:0)            | Browser-decodable; avoid 10-bit / 4:2:2                             |
 | Audio codec    | **AAC** (`mp4a`), stereo           | Only `mp4a` is handled                                              |
 | Keyframes      | Regular IDR interval (~1–2 s)      | `moq-pub` starts a new segment on each keyframe                      |
 | Tracks         | 1 video + 1 audio                  | Sample has exactly 2 tracks; extra TS streams are dropped via `-map` |
-| Fragmentation  | `cmaf+separate_moof+delay_moov+skip_trailer` + `-frag_duration 16000` | Lets `moq-pub` extract the init + per-frame fragments. Do **not** use `frag_every_frame` — see below |
 
 The script transcodes to H.264 High / yuv420p + AAC stereo with `-g 60`
 (~2s keyframes at 30fps) so segmentation is clean and the output always meets
 the constraints above, whatever the source codecs are.
 
-If you change the frame rate, adjust `-g` (it is in *frames*: set it to
-`2 × fps` for ~2s groups). `-frag_duration` needs no adjustment: 16ms is below
-the frame duration up to 60fps, so every frame keeps its own fragment.
-
 > If your source is *already* H.264 + AAC with a sane keyframe cadence, you can
 > save CPU by remuxing instead of transcoding — replace the `-c:v … -c:a …`
 > options in `run-pub-srt.sh` with `-c copy`.
 
-## The audio-dropout bug (`frag_every_frame` + live re-encode)
+## Why each ffmpeg option is used
 
-**Symptom:** playback starts fine, then audio disappears after a few seconds
-and never returns, while video keeps playing. Reproduces every time. In
-`ffplay` the `A-V` drift grows steadily (e.g. to `+0.307`) and then freezes —
-the audio clock has stopped.
+The full ffmpeg command in `run-pub-srt.sh` is tested and working end-to-end
+(OBS → SRT → publisher → relay → player, gapless audio and video). Here's what
+each part does:
 
-**Publisher-side signature:** ffmpeg logs this for (nearly) every audio packet,
-from the very first one:
-
-```
-[mp4 @ ...] Packet duration: -1024 / dts: ... in stream 1 is out of range
-[mp4 @ ...] pts has no value
-```
-
-**Root cause (ffmpeg movenc bug, verified against ffmpeg 8.0.1):** with
-`-movflags +frag_every_frame` the mp4 muxer closes a fragment immediately
-after writing each packet — *before* it knows the next packet's dts — so it
-must **estimate** the closing sample's duration (`check_pkt` /
-`mov_flush_fragment` in `libavformat/movenc.c`). When **both video and audio
-are encoded live** (interleaved arrival), the estimate overshoots the audio
-track by exactly one AAC frame (1024 samples). Every subsequent audio packet
-then appears to land *behind* the muxer's reference, so movenc clamps its dts
-and discards its pts — corrupting the fragment timeline that `moq-pub`
-streams. The player's audio clock drifts until it gives up.
-
-Things that were **ruled out** while troubleshooting (don't chase these):
-
-- **Not SRT and not OBS.** The bug reproduces with a plain local MPEG-TS
-  *file* run through the same ffmpeg command — no network involved. The MoQ
-  transport is also fine: `moq-sub` debug logs show audio objects arriving in
-  lockstep with video the whole time.
-- **Not source timestamps.** Probe the raw SRT feed if in doubt:
-
-  ```bash
-  ffprobe -v error -select_streams a:0 \
-    -show_entries packet=pts_time,dts_time,duration_time \
-    -read_intervals '%+5' -of csv 'srt://0.0.0.0:9999?mode=listener'
-  ```
-
-  Monotonic `pts_time`/`dts_time` with steady `duration_time` (`0.021333` =
-  1024/48000) means the source is clean — and it was.
-- **Not the filter chain.** The errors appear with or without
-  `setpts`/`asetpts`/`aresample`, and shifting audio pts (e.g. to absorb AAC
-  encoder priming) doesn't help.
-- **Not fixable with mux tweaks around the flag:** `-avoid_negative_ts`,
-  `-use_editlist 0`, `+negative_cts_offsets`, and dropping `delay_moov` all
-  still error. Only removing `frag_every_frame` (or not re-encoding audio,
-  `-c:a copy`) eliminates it. That's why `dev/pub` never hits it: `bbb.fmp4`
-  was fragmented offline with `-c:v copy`, a different interleaving pattern.
-
-**The fix (what the script uses):** time-based fragmentation instead of
-per-frame fragmentation:
-
-```
--movflags cmaf+separate_moof+delay_moov+skip_trailer -frag_duration 16000
-```
-
-With `-frag_duration` a fragment is closed when the *next* packet arrives, so
-sample durations are exact and no estimation happens — zero muxer errors and a
-gapless audio timeline (verified end-to-end: OBS → SRT → publisher → relay →
-`moq-sub`, uniform 1024-sample spacing across the whole capture). 16ms is
-below one frame duration up to 60fps, so chunking and latency are the same as
-`frag_every_frame`: one fragment per frame. AAC audio (21.3ms per frame at
-48kHz) always gets one fragment per frame regardless of the video rate.
-
-## Timestamp hygiene (kept in the script, but not the dropout fix)
-
+- **`-map 0:v:0 -map 0:a:0`** — selects exactly one video + one audio stream,
+  dropping any subtitle/KLV/data tracks the source might carry.
+- **`-c:v libx264 -preset veryfast -tune zerolatency -profile:v high -pix_fmt yuv420p`**
+  — encodes video to a browser/`moq-pub`-compatible H.264 profile with low
+  encoding latency.
+- **`-g 60 -keyint_min 60 -sc_threshold 0`** — fixed ~2s keyframe interval at
+  30fps, disabling scene-cut detection so keyframes land on a predictable
+  cadence. `moq-pub` starts a new MoQ group at each keyframe, so a steady
+  interval keeps segmentation clean. If you change the source frame rate, set
+  `-g` to `2 × fps` to keep ~2s groups.
 - **`-vf setpts=PTS-STARTPTS`** / **`-af asetpts=PTS-STARTPTS`** — rebase both
-  streams to a zero-based timeline regardless of the source's MPEG-TS PCR
-  origin, preserving A/V sync.
-- **`-af aresample=async=1`** — guards against SRT burst jitter by keeping the
-  audio timeline continuous.
-- **`-ar 48000`** — pins the audio sample rate so every frame matches the init
-  `moov` (a mid-stream rate change can mute audio).
+  streams to a zero-based timeline, preserving A/V sync regardless of the
+  source's timestamp origin.
+- **`-c:a aac -b:a 128k -ac 2 -ar 48000`** — encodes audio to stereo AAC at a
+  fixed 48kHz sample rate, matching the init segment `moq-pub` generates.
+- **`-af aresample=async=1`** — smooths out small timing jitter from a live
+  SRT feed so the audio timeline stays continuous.
+- **`-movflags cmaf+separate_moof+delay_moov+skip_trailer`** — produces
+  fragmented MP4 (moof/mdat pairs) with a separate init segment, the format
+  `moq-pub` expects.
+- **`-frag_duration 16000`** — fragments the output roughly every 16ms
+  (**recommended over the default `frag_every_frame`**, see below).
 
-> Do **not** use `-use_wallclock_as_timestamps 1` here: on a bursty SRT feed it
-> stamps packets by arrival time, collapsing their deltas to ~0 and producing
-> negative durations.
+> Do **not** use `-use_wallclock_as_timestamps 1`: on a bursty SRT feed it
+> stamps packets by arrival time, which collapses packet deltas to ~0 and
+> produces negative durations.
 
-## Other safe flags (no side effects on well-formed streams)
+## `-frag_duration` vs. `frag_every_frame`
 
-- **`-map 0:v:0 -map 0:a:0`** — *(included)* selects exactly one video + one
-  audio stream, dropping subtitles/KLV/data tracks that `moq-pub` doesn't
-  handle. No effect on a clean 2-track source.
-- **Drop `-re` and `-stream_loop`** — *(done)* those are for files; a live SRT
-  feed is already realtime, so omitting them is correct, not a workaround.
+Use `-frag_duration 16000` instead of `-movflags +frag_every_frame`.
 
-## Flags to add only if you hit the specific problem
+Both produce one fragment per video frame in practice (16ms is shorter than a
+frame at up to 60fps, and an AAC frame is always 21.3ms at 48kHz — so audio
+always gets one fragment per frame either way). The difference is *how* the
+fragment boundary is decided:
 
-- **`-vsync cfr` / `-r <fps>`** — forces a constant frame rate by
-  dropping/duplicating frames. Use only if a variable-frame-rate source causes
-  playback stutter.
-- **`-c copy`** — skip transcoding to save CPU **only** if the source is already
-  H.264 + AAC with a sane keyframe cadence (replaces the `-c:v … -c:a …` opts).
+- `frag_every_frame` closes each fragment immediately, without seeing the next
+  packet's timestamp.
+- `-frag_duration` closes a fragment once the next packet's timestamp would
+  exceed the target duration, so it always has the real timestamp available.
+
+In practice, `-frag_duration` has produced clean, gapless audio in every test
+against a live re-encoded SRT source, while `frag_every_frame` has caused
+audio dropouts a few seconds into playback. Stick with `-frag_duration` for
+live ingest with `moq-pub`.
 
 ## Testing
 
