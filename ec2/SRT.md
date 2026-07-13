@@ -60,57 +60,99 @@ what browsers decode:
 | Audio codec    | **AAC** (`mp4a`), stereo           | Only `mp4a` is handled                                              |
 | Keyframes      | Regular IDR interval (~1–2 s)      | `moq-pub` starts a new segment on each keyframe                      |
 | Tracks         | 1 video + 1 audio                  | Sample has exactly 2 tracks; extra TS streams are dropped via `-map` |
-| Fragmentation  | `cmaf+separate_moof+delay_moov+skip_trailer+frag_every_frame` | Lets `moq-pub` extract the init + per-frame fragments |
+| Fragmentation  | `cmaf+separate_moof+delay_moov+skip_trailer` + `-frag_duration 16000` | Lets `moq-pub` extract the init + per-frame fragments. Do **not** use `frag_every_frame` — see below |
 
 The script transcodes to H.264 High / yuv420p + AAC stereo with `-g 60`
 (~2s keyframes at 30fps) so segmentation is clean and the output always meets
 the constraints above, whatever the source codecs are.
 
+If you change the frame rate, adjust `-g` (it is in *frames*: set it to
+`2 × fps` for ~2s groups). `-frag_duration` needs no adjustment: 16ms is below
+the frame duration up to 60fps, so every frame keeps its own fragment.
+
 > If your source is *already* H.264 + AAC with a sane keyframe cadence, you can
 > save CPU by remuxing instead of transcoding — replace the `-c:v … -c:a …`
 > options in `run-pub-srt.sh` with `-c copy`.
 
-## Timestamp handling (why audio can drop out)
+## The audio-dropout bug (`frag_every_frame` + live re-encode)
 
-Live SRT/MPEG-TS sources carry valid timestamps, but with a **large origin** —
-the MPEG-TS PCR starts at a high value rather than 0. The CMAF fragment muxer
-rejects that, logging:
+**Symptom:** playback starts fine, then audio disappears after a few seconds
+and never returns, while video keeps playing. Reproduces every time. In
+`ffplay` the `A-V` drift grows steadily (e.g. to `+0.307`) and then freezes —
+the audio clock has stopped.
+
+**Publisher-side signature:** ffmpeg logs this for (nearly) every audio packet,
+from the very first one:
 
 ```
-[mp4 @ ...] pts has no value
 [mp4 @ ...] Packet duration: -1024 / dts: ... in stream 1 is out of range
+[mp4 @ ...] pts has no value
 ```
 
-The audio bytes still arrive at the player, but with a broken output timeline
-the player drops audio after a few seconds while video keeps playing. `moq-sub`
-debug logs confirm this: the audio track keeps receiving objects in lockstep
-with video, yet playback goes silent — a muxing-timestamp problem, not a MoQ
-transport problem.
+**Root cause (ffmpeg movenc bug, verified against ffmpeg 8.0.1):** with
+`-movflags +frag_every_frame` the mp4 muxer closes a fragment immediately
+after writing each packet — *before* it knows the next packet's dts — so it
+must **estimate** the closing sample's duration (`check_pkt` /
+`mov_flush_fragment` in `libavformat/movenc.c`). When **both video and audio
+are encoded live** (interleaved arrival), the estimate overshoots the audio
+track by exactly one AAC frame (1024 samples). Every subsequent audio packet
+then appears to land *behind* the muxer's reference, so movenc clamps its dts
+and discards its pts — corrupting the fragment timeline that `moq-pub`
+streams. The player's audio clock drifts until it gives up.
 
-You can confirm the source itself is clean by probing the raw SRT audio:
+Things that were **ruled out** while troubleshooting (don't chase these):
 
-```bash
-ffprobe -v error -select_streams a:0 \
-  -show_entries packet=pts_time,dts_time,duration_time \
-  -read_intervals '%+5' -of csv 'srt://0.0.0.0:9999?mode=listener'
+- **Not SRT and not OBS.** The bug reproduces with a plain local MPEG-TS
+  *file* run through the same ffmpeg command — no network involved. The MoQ
+  transport is also fine: `moq-sub` debug logs show audio objects arriving in
+  lockstep with video the whole time.
+- **Not source timestamps.** Probe the raw SRT feed if in doubt:
+
+  ```bash
+  ffprobe -v error -select_streams a:0 \
+    -show_entries packet=pts_time,dts_time,duration_time \
+    -read_intervals '%+5' -of csv 'srt://0.0.0.0:9999?mode=listener'
+  ```
+
+  Monotonic `pts_time`/`dts_time` with steady `duration_time` (`0.021333` =
+  1024/48000) means the source is clean — and it was.
+- **Not the filter chain.** The errors appear with or without
+  `setpts`/`asetpts`/`aresample`, and shifting audio pts (e.g. to absorb AAC
+  encoder priming) doesn't help.
+- **Not fixable with mux tweaks around the flag:** `-avoid_negative_ts`,
+  `-use_editlist 0`, `+negative_cts_offsets`, and dropping `delay_moov` all
+  still error. Only removing `frag_every_frame` (or not re-encoding audio,
+  `-c:a copy`) eliminates it. That's why `dev/pub` never hits it: `bbb.fmp4`
+  was fragmented offline with `-c:v copy`, a different interleaving pattern.
+
+**The fix (what the script uses):** time-based fragmentation instead of
+per-frame fragmentation:
+
+```
+-movflags cmaf+separate_moof+delay_moov+skip_trailer -frag_duration 16000
 ```
 
-Monotonic `pts_time`/`dts_time` with a steady `duration_time` (e.g. `0.021333`
-= 1024/48000) means the source is fine and the fix belongs in ffmpeg's output.
+With `-frag_duration` a fragment is closed when the *next* packet arrives, so
+sample durations are exact and no estimation happens — zero muxer errors and a
+gapless audio timeline (verified end-to-end: OBS → SRT → publisher → relay →
+`moq-sub`, uniform 1024-sample spacing across the whole capture). 16ms is
+below one frame duration up to 60fps, so chunking and latency are the same as
+`frag_every_frame`: one fragment per frame. AAC audio (21.3ms per frame at
+48kHz) always gets one fragment per frame regardless of the video rate.
 
-The script rebases both streams to start at 0:
+## Timestamp hygiene (kept in the script, but not the dropout fix)
 
-- **`-vf setpts=PTS-STARTPTS`** / **`-af asetpts=PTS-STARTPTS`** — *(included)*
-  subtract each stream's first PTS so timestamps start at 0, keeping the
-  source's timing and A/V sync intact while fixing the "out of range" rejection.
-- **`-af aresample=async=1`** — *(included)* guards against SRT burst jitter by
-  keeping the audio timeline continuous.
-- **`-ar 48000`** — *(included)* pins the audio sample rate so every frame
-  matches the init `moov` (a mid-stream rate change can mute audio).
+- **`-vf setpts=PTS-STARTPTS`** / **`-af asetpts=PTS-STARTPTS`** — rebase both
+  streams to a zero-based timeline regardless of the source's MPEG-TS PCR
+  origin, preserving A/V sync.
+- **`-af aresample=async=1`** — guards against SRT burst jitter by keeping the
+  audio timeline continuous.
+- **`-ar 48000`** — pins the audio sample rate so every frame matches the init
+  `moov` (a mid-stream rate change can mute audio).
 
 > Do **not** use `-use_wallclock_as_timestamps 1` here: on a bursty SRT feed it
 > stamps packets by arrival time, collapsing their deltas to ~0 and producing
-> negative durations — it makes the audio dropout worse, not better.
+> negative durations.
 
 ## Other safe flags (no side effects on well-formed streams)
 
@@ -139,3 +181,21 @@ moq-sub --name bbb 'https://<your-domain>.duckdns.org:4443' | ffplay -
 Or point a draft-14 moq-js player in Chrome at the same URL (broadcast `bbb`,
 catalog `.catalog`). Remember the start order: **relay → publisher →
 subscriber** (the init segment is emitted once when ffmpeg starts).
+
+To verify audio continuity objectively (instead of listening), capture the
+broadcast to a file and check that every audio packet is exactly one AAC frame
+(1024 samples) after the previous one:
+
+```bash
+timeout 40 moq-sub --name bbb 'https://<your-domain>.duckdns.org:4443' > capture.mp4
+ffprobe -v error -select_streams a -show_packets -show_entries packet=pts \
+  -of csv=p=0 capture.mp4 | python3 -c "
+import sys
+pts=[int(float(l.split(',')[0])) for l in sys.stdin if l.strip()]
+gaps=[(a,b) for a,b in zip(pts,pts[1:]) if b-a != 1024]
+print(f'{len(pts)} packets, {len(gaps)} gaps', gaps[:5])"
+```
+
+Zero gaps means the audio timeline is clean. (A single "Packet corrupt"
+warning at the very end of the capture is just the file being truncated
+mid-fragment by `timeout` — not a stream problem.)
