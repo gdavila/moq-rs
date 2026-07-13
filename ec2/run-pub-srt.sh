@@ -39,7 +39,16 @@ if [ ! -x "$MOQ_PUB" ]; then
 fi
 
 # CMAF fragmentation flags required by moq-pub.
-FRAG=(-f mp4 -movflags cmaf+separate_moof+delay_moov+skip_trailer+frag_every_frame)
+#
+# NOTE: frag_every_frame is intentionally NOT used. When both video and audio
+# are re-encoded live, ffmpeg's mp4 muxer (movenc) mis-estimates the audio
+# track duration on the per-frame fragment flushes, clamping every audio
+# packet ("Packet duration: -1024 ... out of range" / "pts has no value").
+# The corrupted audio fragment timeline makes players drop audio after a few
+# seconds. Time-based fragmentation (-frag_duration) gives the same per-frame
+# chunking without triggering the bug. 16ms is below the frame duration up to
+# 60fps, so every video frame still gets its own fragment.
+FRAG=(-f mp4 -movflags cmaf+separate_moof+delay_moov+skip_trailer -frag_duration 16000)
 
 log "SRT ingest: ${SRT_URL}"
 log "Publishing broadcast '${NAME}' to ${URL} (transcode to H.264/AAC)"
@@ -47,13 +56,11 @@ log "Publishing broadcast '${NAME}' to ${URL} (transcode to H.264/AAC)"
 # Always transcode: normalize to H.264 High / yuv420p + AAC stereo.
 # -g 60 gives ~2s keyframe interval at 30fps so moq-pub segments cleanly.
 #
-# Timestamp handling: live SRT/MPEG-TS sources (e.g. OBS) carry valid but
-# large-origin timestamps (the MPEG-TS PCR starts at a high value). The CMAF
-# fragment muxer rejects that large starting DTS ("Packet duration ... out of
-# range" / "pts has no value"), which makes audio drop out after a few seconds
-# while video keeps playing. Rebase both streams to start at 0 with
-# setpts/asetpts (preserving the source's timing and A/V sync); aresample guards
-# against SRT burst jitter; -ar 48000 pins the rate to match the init moov.
+# Timestamp handling: setpts/asetpts rebase both streams to start at 0
+# (preserving the source's timing and A/V sync) so downstream tooling sees a
+# zero-based timeline regardless of the source's MPEG-TS PCR origin; aresample
+# guards against SRT burst jitter; -ar 48000 pins the rate to match the init
+# moov.
 # NOTE: do NOT use -use_wallclock_as_timestamps here — on bursty SRT it collapses
 # packet deltas to ~0 and produces negative durations.
 ffmpeg -hide_banner \
