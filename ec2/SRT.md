@@ -70,33 +70,52 @@ the constraints above, whatever the source codecs are.
 > save CPU by remuxing instead of transcoding — replace the `-c:v … -c:a …`
 > options in `run-pub-srt.sh` with `-c copy`.
 
-## Gotchas (safe, no side effects on well-formed streams)
+## Timestamp handling (why audio can drop out)
 
-These are baked into `run-pub-srt.sh` or listed as safe additions:
+Live SRT/MPEG-TS sources — **OBS in particular** — often emit audio packets with
+missing PTS and out-of-range DTS. ffmpeg logs it as:
 
-- **`-fflags +genpts`** — *(included in the script)* generates presentation
-  timestamps only for packets that are **missing** them. TS from SRT sometimes
-  has gaps; this fills them. On a well-formed stream it changes nothing (it does
-  not overwrite existing PTS), so it is safe to leave on.
+```
+[mp4 @ ...] pts has no value
+[mp4 @ ...] Packet duration: -1024 / dts: ... in stream 1 is out of range
+```
+
+The audio bytes still arrive at the player, but with no valid timeline the
+player drops audio after a few seconds while video keeps playing. `moq-sub`
+debug logs confirm this pattern: the audio track keeps receiving objects in
+lockstep with video, yet playback goes silent — a source-timestamp problem, not
+a MoQ transport problem.
+
+The script fixes this with three flags:
+
+- **`-use_wallclock_as_timestamps 1`** — *(included, input option before `-i`)*
+  discards the broken source PTS/DTS and stamps packets on arrival. This is the
+  canonical remedy for live SRT/RTMP with bad timestamps, and it fixes the
+  "pts has no value" for both streams so A/V stay aligned.
+- **`-af aresample=async=1`** — *(included)* regenerates a continuous audio PTS
+  and inserts/drops samples to keep audio locked to the timeline.
+- **`-ar 48000`** — *(included)* pins the audio sample rate so every frame
+  matches the init `moov` (a mid-stream rate change can mute audio).
+
+> The real bug is upstream — the encoder shouldn't emit audio without valid
+> timestamps. If you control the source (e.g. OBS output settings), fixing it
+> there is cleaner, but the flags above make the publisher resilient regardless.
+
+## Other safe flags (no side effects on well-formed streams)
+
 - **`-map 0:v:0 -map 0:a:0`** — *(included)* selects exactly one video + one
   audio stream, dropping subtitles/KLV/data tracks that `moq-pub` doesn't
   handle. No effect on a clean 2-track source.
 - **Drop `-re` and `-stream_loop`** — *(done)* those are for files; a live SRT
   feed is already realtime, so omitting them is correct, not a workaround.
 
-## Gotchas that DO have side effects — apply only if you hit the problem
+## Flags to add only if you hit the specific problem
 
-These are intentionally **not** in the script because they alter timing/audio
-even on good streams. Add them manually only to fix a specific symptom:
-
-- **`-af aresample=async=1`** — pads/stretches audio to keep A/V in sync. Fixes
-  audible drift on bad TS, but resamples audio unconditionally. Use only if you
-  observe A/V drift.
 - **`-vsync cfr` / `-r <fps>`** — forces a constant frame rate by
   dropping/duplicating frames. Use only if a variable-frame-rate source causes
   playback stutter.
-- **`-c:v libx264` on an already-H.264 source** — re-encoding costs CPU and
-  quality. Prefer `-c copy` unless the codec is genuinely incompatible.
+- **`-c copy`** — skip transcoding to save CPU **only** if the source is already
+  H.264 + AAC with a sane keyframe cadence (replaces the `-c:v … -c:a …` opts).
 
 ## Testing
 
