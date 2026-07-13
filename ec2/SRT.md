@@ -104,22 +104,11 @@ each part does:
 
 ## `-frag_duration` vs. `frag_every_frame`
 
-Use `-frag_duration 16000` instead of `-movflags +frag_every_frame`.
-
-Both produce one fragment per video frame in practice (16ms is shorter than a
-frame at up to 60fps, and an AAC frame is always 21.3ms at 48kHz — so audio
-always gets one fragment per frame either way). The difference is *how* the
-fragment boundary is decided:
-
-- `frag_every_frame` closes each fragment immediately, without seeing the next
-  packet's timestamp.
-- `-frag_duration` closes a fragment once the next packet's timestamp would
-  exceed the target duration, so it always has the real timestamp available.
-
-In practice, `-frag_duration` has produced clean, gapless audio in every test
-against a live re-encoded SRT source, while `frag_every_frame` has caused
-audio dropouts a few seconds into playback. Stick with `-frag_duration` for
-live ingest with `moq-pub`.
+Use `-frag_duration 16000` instead of `-movflags +frag_every_frame`. Both
+produce one fragment per video frame in practice (16ms is shorter than a
+frame at up to 60fps, and an AAC frame is always 21.3ms at 48kHz), but
+`-frag_duration` has proven reliable for live re-encoded audio, so it's the
+one this script uses.
 
 ## Testing
 
@@ -129,24 +118,11 @@ Publish, then subscribe from your laptop:
 moq-sub --name bbb 'https://<your-domain>.duckdns.org:4443' | ffplay -
 ```
 
-Or point a draft-14 moq-js player in Chrome at the same URL (broadcast `bbb`,
-catalog `.catalog`). Remember the start order: **relay → publisher →
-subscriber** (the init segment is emitted once when ffmpeg starts).
+Remember the start order: **relay → publisher → subscriber** (the init
+segment is emitted once when ffmpeg starts).
 
-To verify audio continuity objectively (instead of listening), capture the
-broadcast to a file and check that every audio packet is exactly one AAC frame
-(1024 samples) after the previous one:
+Playback of the SRT proxy has been verified against `dev/sub` (this repo's
+local subscriber) and against the hosted player at
+[demo.bitmovin.com/public/pwx-moq](https://demo.bitmovin.com/public/pwx-moq/)
+(broadcast `bbb`, catalog `.catalog`).
 
-```bash
-timeout 40 moq-sub --name bbb 'https://<your-domain>.duckdns.org:4443' > capture.mp4
-ffprobe -v error -select_streams a -show_packets -show_entries packet=pts \
-  -of csv=p=0 capture.mp4 | python3 -c "
-import sys
-pts=[int(float(l.split(',')[0])) for l in sys.stdin if l.strip()]
-gaps=[(a,b) for a,b in zip(pts,pts[1:]) if b-a != 1024]
-print(f'{len(pts)} packets, {len(gaps)} gaps', gaps[:5])"
-```
-
-Zero gaps means the audio timeline is clean. (A single "Packet corrupt"
-warning at the very end of the capture is just the file being truncated
-mid-fragment by `timeout` — not a stream problem.)

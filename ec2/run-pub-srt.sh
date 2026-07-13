@@ -38,16 +38,9 @@ if [ ! -x "$MOQ_PUB" ]; then
 	( cd "$REPO_ROOT" && cargo build --release --bin moq-pub )
 fi
 
-# CMAF fragmentation flags required by moq-pub.
-#
-# NOTE: frag_every_frame is intentionally NOT used. When both video and audio
-# are re-encoded live, ffmpeg's mp4 muxer (movenc) mis-estimates the audio
-# track duration on the per-frame fragment flushes, clamping every audio
-# packet ("Packet duration: -1024 ... out of range" / "pts has no value").
-# The corrupted audio fragment timeline makes players drop audio after a few
-# seconds. Time-based fragmentation (-frag_duration) gives the same per-frame
-# chunking without triggering the bug. 16ms is below the frame duration up to
-# 60fps, so every video frame still gets its own fragment.
+# CMAF fragmentation flags required by moq-pub. -frag_duration 16000 fragments
+# roughly every 16ms, which is below one frame at up to 60fps, so every video
+# frame gets its own fragment.
 FRAG=(-f mp4 -movflags cmaf+separate_moof+delay_moov+skip_trailer -frag_duration 16000)
 
 log "SRT ingest: ${SRT_URL}"

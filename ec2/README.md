@@ -1,8 +1,15 @@
 # Running moq-rs on an EC2 / Ubuntu instance with valid TLS
 
-This folder sets up an Ubuntu EC2 instance as a moq-rs **pub/relay** with a
-browser-trusted TLS certificate, so MOQ/QUIC (WebTransport) playback works in
-Chrome and with native clients.
+This folder turns a plain Ubuntu EC2 instance into a moq-rs **publisher +
+relay** with a browser-trusted TLS certificate, so MOQ/QUIC (WebTransport)
+playback works in Chrome and with native clients. It also includes a small
+**SRT-to-MoQ proxy**: point an encoder (e.g. OBS) at the instance over SRT and
+ffmpeg republishes it as a live MoQ broadcast — see [SRT.md](SRT.md) for that
+part.
+
+In short, the intended use case is: give the instance a domain + valid cert,
+build moq-rs on it, then run either the bundled sample stream or a live SRT
+feed as a MoQ broadcast that any MOQ/WebTransport player can subscribe to.
 
 ## Why a DuckDNS domain (not the EC2 hostname)
 
@@ -55,18 +62,26 @@ moq-sub --name bbb 'https://<your-domain>.duckdns.org:4443' | ffplay -
 Or in Chrome, point a draft-14 moq-js player at
 `https://<your-domain>.duckdns.org:4443` (broadcast `bbb`, catalog `.catalog`).
 
+Playback has been verified both against `dev/sub` (this repo's local
+subscriber) and against the hosted player at
+[demo.bitmovin.com/public/pwx-moq](https://demo.bitmovin.com/public/pwx-moq/).
+
 ## Scripts
 
-| Script                | What it does                                                        |
-|-----------------------|--------------------------------------------------------------------|
-| `setup.sh`            | Runs everything below in order, then builds the moq-rs binaries.    |
-| `01-install-deps.sh`  | apt build toolchain (`cmake`/`clang` for aws-lc-sys), ffmpeg, Rust. |
-| `02-issue-cert.sh`    | Installs certbot + DuckDNS plugin and issues the cert via DNS-01.   |
-| `03-setup-certs.sh`   | Copies PEMs to a user-readable dir; adds loopback `/etc/hosts`.     |
-| `run-relay.sh`        | Starts the relay with the Let's Encrypt cert.                       |
-| `run-pub.sh`          | Publishes the sample (Big Buck Bunny) stream to the relay.          |
-| `run-pub-srt.sh`      | Publishes a live **SRT** ingest — see [SRT.md](SRT.md).            |
-| `renew-certs.sh`      | Renews the cert and refreshes the relay-readable copies.            |
+| Script                | What it does                                                          |
+|-----------------------|------------------------------------------------------------------------|
+| `setup.sh`            | Runs everything below in order, then builds the moq-rs binaries.      |
+| `01-install-deps.sh`  | apt build toolchain (`cmake`/`clang` for aws-lc-sys), ffmpeg, Rust.    |
+| `02-issue-cert.sh`    | Installs certbot + DuckDNS plugin and issues the cert via DNS-01.      |
+| `03-setup-certs.sh`   | Copies PEMs to a user-readable dir; adds loopback `/etc/hosts`.        |
+| `run-relay.sh`        | Starts the moq-rs relay with the Let's Encrypt cert.                   |
+| `run-pub.sh`          | Publishes the bundled sample (Big Buck Bunny) as a MoQ broadcast.      |
+| `run-pub-srt.sh`      | SRT-to-MoQ proxy: ffmpeg ingests a live SRT stream and republishes it as a MoQ broadcast — full details in [SRT.md](SRT.md). |
+| `renew-certs.sh`      | Renews the cert and refreshes the relay-readable copies.              |
+
+`setup.sh`, `run-relay.sh`, and `run-pub.sh`/`run-pub-srt.sh` together are what
+make the instance "pub/relay ready": a relay with a valid cert, plus a choice
+of publisher (sample file or live SRT ingest).
 
 All scripts read `config.sh` (git-ignored, so your token stays private).
 
@@ -88,18 +103,14 @@ EOF
 sudo chmod +x /etc/letsencrypt/renewal-hooks/deploy/moq.sh
 ```
 
-## Gotchas we hit (and fixed)
+## Operational notes
 
 - **QUIC is UDP** — open UDP 4443 in the Security Group, not just TCP.
-- **Same-box publisher** connecting to the public domain can fail to hairpin
-  over UDP. `03-setup-certs.sh` adds `127.0.0.1 <domain>` to `/etc/hosts` so the
-  traffic stays local while the cert hostname still validates.
-- **Start order matters:** relay → publisher → subscriber. The fMP4 init
-  segment is published once (group 0) when the publisher's ffmpeg starts; a
-  subscriber that joins a session without it gets media but no `moov`. Restart
-  the subscriber whenever you restart the publisher.
-- **`moq-sub` logs vs. media:** `moq-sub` writes media to stdout, so logs must
-  go to stderr (fixed in this repo). If you use an older build, prefix commands
-  with `RUST_LOG=off` before piping to `ffplay -`.
-- **Video-only players:** the sample broadcast has both video and audio; make
-  sure your player handles/subscribes to both tracks listed in the catalog.
+- **Same-box publisher:** `03-setup-certs.sh` adds `127.0.0.1 <domain>` to
+  `/etc/hosts` so a publisher running on the same instance as the relay
+  connects over loopback while the cert hostname still validates.
+- **Start order:** relay → publisher → subscriber. The fMP4 init segment is
+  published once (group 0) when the publisher's ffmpeg starts, so a subscriber
+  should join after the publisher is running.
+- **`moq-sub` logs go to stderr**, media to stdout, so it can be piped directly
+  into `ffplay -`.
