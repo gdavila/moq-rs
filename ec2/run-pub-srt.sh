@@ -47,19 +47,22 @@ log "Publishing broadcast '${NAME}' to ${URL} (transcode to H.264/AAC)"
 # Always transcode: normalize to H.264 High / yuv420p + AAC stereo.
 # -g 60 gives ~2s keyframe interval at 30fps so moq-pub segments cleanly.
 #
-# Timestamp handling: live SRT/MPEG-TS sources (e.g. OBS) can emit audio packets
-# with missing PTS and out-of-range DTS ("pts has no value" / "Packet duration
-# out of range"), which makes audio drop out after a few seconds while video
-# keeps playing. -use_wallclock_as_timestamps 1 discards the broken source clock
-# and stamps packets on arrival; -af aresample=async=1 regenerates a continuous
-# audio PTS; -ar 48000 pins the sample rate so every frame matches the init moov.
+# Timestamp handling: live SRT/MPEG-TS sources (e.g. OBS) carry valid but
+# large-origin timestamps (the MPEG-TS PCR starts at a high value). The CMAF
+# fragment muxer rejects that large starting DTS ("Packet duration ... out of
+# range" / "pts has no value"), which makes audio drop out after a few seconds
+# while video keeps playing. Rebase both streams to start at 0 with
+# setpts/asetpts (preserving the source's timing and A/V sync); aresample guards
+# against SRT burst jitter; -ar 48000 pins the rate to match the init moov.
+# NOTE: do NOT use -use_wallclock_as_timestamps here — on bursty SRT it collapses
+# packet deltas to ~0 and produces negative durations.
 ffmpeg -hide_banner \
-	-use_wallclock_as_timestamps 1 \
 	-i "$SRT_URL" \
 	-map 0:v:0 -map 0:a:0 \
 	-c:v libx264 -preset veryfast -tune zerolatency \
 	-profile:v high -pix_fmt yuv420p \
 	-g 60 -keyint_min 60 -sc_threshold 0 \
-	-c:a aac -b:a 128k -ac 2 -ar 48000 -af aresample=async=1 \
+	-vf setpts=PTS-STARTPTS \
+	-c:a aac -b:a 128k -ac 2 -ar 48000 -af aresample=async=1,asetpts=PTS-STARTPTS \
 	"${FRAG[@]}" \
 	- | "$MOQ_PUB" --name "$NAME" "$URL"

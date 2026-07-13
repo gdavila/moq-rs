@@ -72,34 +72,45 @@ the constraints above, whatever the source codecs are.
 
 ## Timestamp handling (why audio can drop out)
 
-Live SRT/MPEG-TS sources — **OBS in particular** — often emit audio packets with
-missing PTS and out-of-range DTS. ffmpeg logs it as:
+Live SRT/MPEG-TS sources carry valid timestamps, but with a **large origin** —
+the MPEG-TS PCR starts at a high value rather than 0. The CMAF fragment muxer
+rejects that, logging:
 
 ```
 [mp4 @ ...] pts has no value
 [mp4 @ ...] Packet duration: -1024 / dts: ... in stream 1 is out of range
 ```
 
-The audio bytes still arrive at the player, but with no valid timeline the
-player drops audio after a few seconds while video keeps playing. `moq-sub`
-debug logs confirm this pattern: the audio track keeps receiving objects in
-lockstep with video, yet playback goes silent — a source-timestamp problem, not
-a MoQ transport problem.
+The audio bytes still arrive at the player, but with a broken output timeline
+the player drops audio after a few seconds while video keeps playing. `moq-sub`
+debug logs confirm this: the audio track keeps receiving objects in lockstep
+with video, yet playback goes silent — a muxing-timestamp problem, not a MoQ
+transport problem.
 
-The script fixes this with three flags:
+You can confirm the source itself is clean by probing the raw SRT audio:
 
-- **`-use_wallclock_as_timestamps 1`** — *(included, input option before `-i`)*
-  discards the broken source PTS/DTS and stamps packets on arrival. This is the
-  canonical remedy for live SRT/RTMP with bad timestamps, and it fixes the
-  "pts has no value" for both streams so A/V stay aligned.
-- **`-af aresample=async=1`** — *(included)* regenerates a continuous audio PTS
-  and inserts/drops samples to keep audio locked to the timeline.
+```bash
+ffprobe -v error -select_streams a:0 \
+  -show_entries packet=pts_time,dts_time,duration_time \
+  -read_intervals '%+5' -of csv 'srt://0.0.0.0:9999?mode=listener'
+```
+
+Monotonic `pts_time`/`dts_time` with a steady `duration_time` (e.g. `0.021333`
+= 1024/48000) means the source is fine and the fix belongs in ffmpeg's output.
+
+The script rebases both streams to start at 0:
+
+- **`-vf setpts=PTS-STARTPTS`** / **`-af asetpts=PTS-STARTPTS`** — *(included)*
+  subtract each stream's first PTS so timestamps start at 0, keeping the
+  source's timing and A/V sync intact while fixing the "out of range" rejection.
+- **`-af aresample=async=1`** — *(included)* guards against SRT burst jitter by
+  keeping the audio timeline continuous.
 - **`-ar 48000`** — *(included)* pins the audio sample rate so every frame
   matches the init `moov` (a mid-stream rate change can mute audio).
 
-> The real bug is upstream — the encoder shouldn't emit audio without valid
-> timestamps. If you control the source (e.g. OBS output settings), fixing it
-> there is cleaner, but the flags above make the publisher resilient regardless.
+> Do **not** use `-use_wallclock_as_timestamps 1` here: on a bursty SRT feed it
+> stamps packets by arrival time, collapsing their deltas to ~0 and producing
+> negative durations — it makes the audio dropout worse, not better.
 
 ## Other safe flags (no side effects on well-formed streams)
 
