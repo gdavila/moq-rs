@@ -64,7 +64,8 @@ Or in Chrome, point a draft-14 moq-js player at
 | `02-issue-cert.sh`    | Installs certbot + DuckDNS plugin and issues the cert via DNS-01.   |
 | `03-setup-certs.sh`   | Copies PEMs to a user-readable dir; adds loopback `/etc/hosts`.     |
 | `run-relay.sh`        | Starts the relay with the Let's Encrypt cert.                       |
-| `run-pub.sh`          | Publishes the sample stream to the relay.                           |
+| `run-pub.sh`          | Publishes the sample (Big Buck Bunny) stream to the relay.          |
+| `run-pub-srt.sh`      | Publishes a live **SRT** ingest — see [SRT.md](SRT.md).            |
 | `renew-certs.sh`      | Renews the cert and refreshes the relay-readable copies.            |
 
 All scripts read `config.sh` (git-ignored, so your token stays private).
