@@ -8,8 +8,10 @@ set -euo pipefail
 # Change directory to the root of the project
 cd "$(dirname "$0")/.."
 
-# Generate the self-signed certificate if needed
-./dev/cert
+# Generate the self-signed certificate only if no cert was provided
+if [ -z "${CERT:-}" ]; then
+	./dev/cert
+fi
 
 # Use debug logging by default
 export RUST_LOG="${RUST_LOG:-debug}"

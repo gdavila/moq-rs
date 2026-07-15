@@ -1,0 +1,2 @@
+# Local config holds your DuckDNS token — never commit it.
+config.sh
